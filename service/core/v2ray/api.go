@@ -150,3 +150,109 @@ func ObservatoryProducer(apiPort int, observatoryTags []string) (closeFunc func(
 		close(closed)
 	}
 }
+
+// getXrayObservationResult queries the official xray-core ObservatoryService. Unlike
+// the v2ray-compatible service, it takes an empty request and returns the entire
+// observation result in a single call, under the xray-native gRPC service name.
+// The request/response wire formats of fields 1-6 are identical to v2ray-core v5, so
+// the v2ray-generated pb types decode xray's response correctly.
+func getXrayObservationResult(conn *grpc.ClientConn) ([]*observatory.OutboundStatus, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	resp := &pb.GetOutboundStatusResponse{}
+	err := conn.Invoke(ctx,
+		"/xray.core.app.observatory.command.ObservatoryService/GetOutboundStatus",
+		&pb.GetOutboundStatusRequest{}, resp)
+	if err != nil {
+		return nil, err
+	}
+	return resp.GetStatus().GetStatus(), nil
+}
+
+// XrayObservatoryProducer monitors outbound status via the official xray-core
+// ObservatoryService and publishes per-group results to ApiFeed. Stock xray has a
+// single global observatory, so the one observation result is regrouped using
+// groupSelectors (balancer group tag -> member outbound tags) to mirror the per-group
+// feed that the v2raya_core MultiObservatory path produces.
+func XrayObservatoryProducer(apiPort int, groupSelectors map[string][]string) (closeFunc func()) {
+	closed := make(chan struct{})
+	// Precompute a membership set per group for fast lookups.
+	groupMembers := make(map[string]map[string]struct{}, len(groupSelectors))
+	for group, members := range groupSelectors {
+		set := make(map[string]struct{}, len(members))
+		for _, m := range members {
+			set[m] = struct{}{}
+		}
+		groupMembers[group] = set
+	}
+	go func() {
+		const product = "observatory"
+		var conn *grpc.ClientConn
+	nextLoop:
+		for {
+			select {
+			case <-closed:
+				return
+			default:
+			}
+			p := ProcessManager.Process()
+			if p == nil {
+				time.Sleep(ApiFeedInterval)
+				continue
+			}
+			if conn == nil {
+				ctx, cancel := context.WithTimeout(context.Background(), ApiFeedInterval)
+				defer cancel()
+				c, err := grpc.DialContext(
+					ctx,
+					net.JoinHostPort("127.0.0.1", strconv.Itoa(apiPort)),
+					grpc.WithInsecure(),
+					grpc.WithBlock(),
+				)
+				if err != nil {
+					log.Warn("XrayObservatoryProducer: did not connect: %v", err)
+					continue nextLoop
+				}
+				defer c.Close()
+				conn = c
+			}
+			statuses, err := getXrayObservationResult(conn)
+			if err != nil {
+				if status.Code(err) == codes.Unavailable {
+					// the connection is unreliable, reconnect
+					conn = nil
+					continue nextLoop
+				}
+				log.Warn("XrayObservatoryProducer: %v", err)
+				time.Sleep(ApiFeedInterval)
+				continue
+			}
+			css := configure.GetConnectedServers()
+			for group, members := range groupMembers {
+				var os []OutboundStatus
+				for _, st := range statuses {
+					if _, ok := members[st.GetOutboundTag()]; !ok {
+						continue
+					}
+					var o OutboundStatus
+					_ = mapper.AutoMapper(st, &o)
+					index := p.tag2WhichIndex[o.OutboundTag]
+					if index >= css.Len() {
+						continue nextLoop
+					}
+					o.Which = css.Get()[index]
+					os = append(os, o)
+				}
+				msg := gin.H{
+					"outboundName":   group,
+					"outboundStatus": os,
+				}
+				ApiFeed.ProductMessage(product, msg)
+			}
+			time.Sleep(ApiFeedInterval)
+		}
+	}()
+	return func() {
+		close(closed)
+	}
+}
