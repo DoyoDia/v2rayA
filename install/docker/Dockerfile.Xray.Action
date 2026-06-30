@@ -1,0 +1,15 @@
+# v2rayA image that additionally bundles the official Xray-core binary.
+# The default backend stays v2raya_core (fully featured). To use the official
+# xray instead, run with: -e V2RAYA_V2RAY_BIN=/usr/bin/xray
+FROM alpine:latest AS builder
+ARG V2RAYA_VERSION
+ARG XRAY_VERSION
+WORKDIR /
+COPY ./install/docker/docker_helper_xray.sh ./docker_helper_xray.sh
+COPY ./install/docker/iptables.sh ./iptables.sh
+COPY ./install/docker/ip6tables.sh ./ip6tables.sh
+RUN V2RAYA_VERSION="${V2RAYA_VERSION}" XRAY_VERSION="${XRAY_VERSION}" sh -c "$(cat ./docker_helper_xray.sh)"
+RUN rm ./docker_helper_xray.sh
+EXPOSE 2017
+VOLUME /etc/v2raya
+ENTRYPOINT ["v2raya"]
