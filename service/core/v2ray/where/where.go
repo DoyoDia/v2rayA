@@ -15,22 +15,41 @@ import (
 )
 
 // Variant identifies the core binary type.
-// Since v2rayA now only supports v2raya_core, this is always V2rayaCore.
 type Variant string
 
 const (
 	// V2rayaCore is the merged v2raya-core binary (xray-core + MultiObservatory).
-	// Binary name: v2raya_core
+	// Binary name: v2raya_core. `v2raya_core version` reports "V2RAYA_CORE x.y.z ...".
 	V2rayaCore Variant = "V2rayaCore"
+	// XrayCore is the upstream official Xray-core binary (binary name: xray).
+	// `xray version` reports "Xray x.y.z ...". It does not understand v2raya_core
+	// extensions (multiObservatory, observerTag, anytls/juicity), so config
+	// generation and the observatory gRPC path adapt when this variant is detected.
+	XrayCore Variant = "XrayCore"
 )
 
 var NotFoundErr = fmt.Errorf("not found")
-var ServiceNameList = []string{"v2raya_core"}
+
+// ServiceNameList is the list of core binary names auto-detected on PATH / next to
+// the v2rayA executable, in priority order. v2raya_core (the merged core) is preferred;
+// the official xray binary is used as a fallback so the xray-flavored image works
+// out of the box without setting V2RAYA_V2RAY_BIN.
+var ServiceNameList = []string{"v2raya_core", "xray"}
 var v2rayVersion struct {
+	variant    Variant
 	version    string
 	binPath    string
 	lastUpdate time.Time
 	mu         sync.Mutex
+}
+
+// variantFromVersionOutput maps the first field of a core's `version` output to a Variant.
+// "Xray" => XrayCore; anything else (e.g. "V2RAYA_CORE") => V2rayaCore.
+func variantFromVersionOutput(firstField string) Variant {
+	if strings.EqualFold(firstField, "xray") {
+		return XrayCore
+	}
+	return V2rayaCore
 }
 
 // GetV2rayServiceVersion returns the version string of the v2raya_core binary.
@@ -38,8 +57,8 @@ func GetV2rayServiceVersion() (variant Variant, ver string, err error) {
 	// cache for 10 seconds
 	v2rayVersion.mu.Lock()
 	defer v2rayVersion.mu.Unlock()
-	if time.Since(v2rayVersion.lastUpdate) < 10*time.Second {
-		return V2rayaCore, v2rayVersion.version, nil
+	if time.Since(v2rayVersion.lastUpdate) < 10*time.Second && v2rayVersion.version != "" {
+		return v2rayVersion.variant, v2rayVersion.version, nil
 	}
 
 	v2rayPath, err := GetV2rayBinPath()
@@ -68,12 +87,14 @@ func GetV2rayServiceVersion() (variant Variant, ver string, err error) {
 	if len(fields) < 2 {
 		return V2rayaCore, "", fmt.Errorf("cannot parse version from output: %q", output.String())
 	}
+	variant = variantFromVersionOutput(fields[0])
 	ver = fields[1]
 
+	v2rayVersion.variant = variant
 	v2rayVersion.version = ver
 	v2rayVersion.binPath = v2rayPath
 	v2rayVersion.lastUpdate = time.Now()
-	return V2rayaCore, ver, nil
+	return variant, ver, nil
 }
 
 func GetV2rayBinPath() (string, error) {

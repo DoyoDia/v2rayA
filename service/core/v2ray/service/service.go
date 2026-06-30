@@ -48,11 +48,18 @@ func CheckAndProbeTProxy() (err error) {
 // strict matching. In release builds, the two binaries are built from the same
 // source tree with the same version string, so they must match exactly.
 func CheckCoreVersionMatch() error {
-	_, coreVer, err := where.GetV2rayServiceVersion()
+	variant, coreVer, err := where.GetV2rayServiceVersion()
 	if err != nil {
 		return fmt.Errorf("failed to get v2raya_core version: %v", err)
 	}
 	serviceVer := conf.Version
+
+	// The official xray-core binary has its own, independent version scheme
+	// (e.g. 26.x) that never matches the v2rayA service version, so strict
+	// matching is meaningless and must be skipped for that variant.
+	if variant == where.XrayCore {
+		return nil
+	}
 
 	// Development builds: skip strict matching
 	var DevVersions = []string{"debug", "unstable"}

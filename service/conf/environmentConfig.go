@@ -55,7 +55,9 @@ func initFunc() {
 		EnvPrefix:         "V2RAYA_",
 	})
 	if err != nil {
-		if err.Error() != "unexpected word while parsing flags: '-test.v'" {
+		// Ignore errors caused by Go test harness flags (-test.v, -test.testlogfile,
+		// -test.paniconexit0, ...) so packages that import conf remain testable.
+		if !strings.Contains(err.Error(), "-test.") {
 			log2.Fatal(err)
 		}
 	}

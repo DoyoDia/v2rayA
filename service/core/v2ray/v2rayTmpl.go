@@ -44,8 +44,10 @@ type Template struct {
 	} `json:"routing"`
 	DNS              *coreObj.DNS              `json:"dns,omitempty"`
 	MultiObservatory *coreObj.MultiObservatory `json:"multiObservatory,omitempty"`
-	Observatory      *coreObj.ObservatoryItem  `json:"observatory,omitempty"`
-	API              *coreObj.APIObject        `json:"api,omitempty"`
+	// Observatory is the single global observatory used by the official xray-core
+	// (which has no multiObservatory). For v2raya_core, MultiObservatory is used instead.
+	Observatory *coreObj.Observatory `json:"observatory,omitempty"`
+	API         *coreObj.APIObject   `json:"api,omitempty"`
 
 	Variant       where.Variant          `json:"-"`
 	CoreVersion   string                 `json:"-"`
@@ -1700,6 +1702,105 @@ func (t *Template) resolveOutbounds(
 	return supportUDP, outboundTags, nil
 }
 
+// buildBalancersAndObservatory populates t.Routing.Balancers and the appropriate
+// observatory config for the detected core variant, returning groupSelectors
+// (balancer group tag -> member outbound tags). It only reads serverData, t.Variant
+// and t.outNames(), so it has no DB dependency and is unit-testable in isolation.
+//
+//   - V2rayaCore: one observer per leastPing group via MultiObservatory, and each
+//     balancer is bound to its observer through strategy.settings.observerTag.
+//   - XrayCore: a single global observatory (stock xray has no multiObservatory) whose
+//     subjectSelector covers every leastPing group; balancers carry no observerTag.
+func (t *Template) buildBalancersAndObservatory(serverData *ServerData) map[string][]string {
+	outbounds := t.outNames()
+	groupSelectors := make(map[string][]string)
+	for outbound, isGroup := range outbounds {
+		if !isGroup {
+			continue
+		}
+
+		//TODO: random, leastload
+		strategy := serverData.OutboundName2Setting[outbound].Type
+		interval, err := time.ParseDuration(serverData.OutboundName2Setting[outbound].ProbeInterval)
+		if err != nil {
+			log.Warn("observatory: %v", err)
+			interval = 10 * time.Second
+		}
+		var selector []string
+
+		for _, vi := range serverData.OutboundName2ServerObjs[outbound] {
+			selector = append(selector, GroupWrapper(vi.GetName()))
+		}
+		groupSelectors[outbound] = selector
+
+		// strategy.settings.observerTag is a v2raya_core extension that binds a
+		// balancer to its dedicated observer in multiObservatory. Stock xray has a
+		// single global observatory and no such field, so it is omitted for xray.
+		var strategySettings *coreObj.StrategySettings
+		if t.Variant != where.XrayCore {
+			strategySettings = &coreObj.StrategySettings{ObserverTag: outbound}
+		}
+		t.Routing.Balancers = append(t.Routing.Balancers, coreObj.Balancer{
+			Tag:      outbound,
+			Selector: selector,
+			Strategy: coreObj.BalancerStrategy{
+				Type:     strategy.String(),
+				Settings: strategySettings,
+			},
+		})
+
+		if strings.ToLower(strategy.String()) == "leastping" {
+			probeUrl := serverData.OutboundName2Setting[outbound].ProbeURL
+			if _, err := url.Parse(probeUrl); err != nil {
+				log.Warn("observatory: %v", err)
+				probeUrl = "https://gstatic.com/generate_204"
+			}
+
+			if t.Variant == where.XrayCore {
+				// Stock xray supports only ONE global observatory; every leastPing
+				// balancer reads it and filters to its own selector, so a single
+				// observatory whose subjectSelector covers all groups is sufficient.
+				// Consequence: all leastPing groups share one probeURL/probeInterval
+				// (the first group's); a warning is logged if a later group differs.
+				if t.Observatory == nil {
+					t.Observatory = &coreObj.Observatory{
+						ProbeURL:      probeUrl,
+						ProbeInterval: interval.String(),
+					}
+				} else if t.Observatory.ProbeURL != probeUrl || t.Observatory.ProbeInterval != interval.String() {
+					log.Warn("observatory: xray-core uses a single global observatory; "+
+						"group %q probe settings (%s, %s) are overridden by the shared ones (%s, %s)",
+						outbound, probeUrl, interval.String(), t.Observatory.ProbeURL, t.Observatory.ProbeInterval)
+				}
+				t.Observatory.SubjectSelector = append(t.Observatory.SubjectSelector, selector...)
+			} else {
+				// v2raya_core: one observer per balancer group (MultiObservatory).
+				if t.MultiObservatory == nil {
+					t.MultiObservatory = &coreObj.MultiObservatory{}
+				}
+				t.MultiObservatory.Observers = append(t.MultiObservatory.Observers, coreObj.ObservatoryItem{
+					Tag: outbound,
+					Settings: coreObj.Observatory{
+						SubjectSelector: selector,
+						PingConfig: &coreObj.PingConfig{
+							Destination: probeUrl,
+							Interval:    interval.String(),
+						},
+						// Keep legacy fields for backward compatibility with older custom cores.
+						ProbeURL:      probeUrl,
+						ProbeInterval: interval.String(),
+					},
+				})
+			}
+		}
+	}
+	// Dedup the merged subjectSelector for xray (groups may share members).
+	if t.Variant == where.XrayCore && t.Observatory != nil {
+		t.Observatory.SubjectSelector = slicex.Uniq(t.Observatory.SubjectSelector)
+	}
+	return groupSelectors
+}
+
 func (t *Template) SetAPI(serverData *ServerData) (port int, err error) {
 	// find a valid port
 	config := configure.GetPortsNotNil()
@@ -1721,74 +1822,21 @@ func (t *Template) SetAPI(serverData *ServerData) (port int, err error) {
 	services = slicex.Uniq(append(services, config.Api.Services...))
 	// observatory
 	if serverData != nil {
-		outbounds := t.outNames()
-		for outbound, isGroup := range outbounds {
-			if !isGroup {
-				continue
-			}
-
-			//TODO: random, leastload
-			strategy := serverData.OutboundName2Setting[outbound].Type
-			interval, err := time.ParseDuration(serverData.OutboundName2Setting[outbound].ProbeInterval)
-			if err != nil {
-				log.Warn("observatory: %v", err)
-				interval = 10 * time.Second
-			}
-			var selector []string
-
-			for _, vi := range serverData.OutboundName2ServerObjs[outbound] {
-				selector = append(selector, GroupWrapper(vi.GetName()))
-			}
-
-			t.Routing.Balancers = append(t.Routing.Balancers, coreObj.Balancer{
-				Tag:      outbound,
-				Selector: selector,
-				Strategy: coreObj.BalancerStrategy{
-					Type: strategy.String(),
-					Settings: &coreObj.StrategySettings{
-						ObserverTag: outbound,
-					},
-				},
-			})
-
-			if strings.ToLower(strategy.String()) == "leastping" {
-				probeUrl := serverData.OutboundName2Setting[outbound].ProbeURL
-				if _, err := url.Parse(probeUrl); err != nil {
-					log.Warn("observatory: %v", err)
-					probeUrl = "https://gstatic.com/generate_204"
-				}
-
-				// v2raya_core always uses MultiObservatory: one observer per balancer group.
-				if t.MultiObservatory == nil {
-					t.MultiObservatory = &coreObj.MultiObservatory{}
-				}
-				t.MultiObservatory.Observers = append(t.MultiObservatory.Observers, coreObj.ObservatoryItem{
-					Tag: outbound,
-					Settings: coreObj.Observatory{
-						SubjectSelector: selector,
-						PingConfig: &coreObj.PingConfig{
-							Destination: probeUrl,
-							Interval:    interval.String(),
-						},
-						// Keep legacy fields for backward compatibility with older custom cores.
-						ProbeURL:      probeUrl,
-						ProbeInterval: interval.String(),
-					},
-				})
-			}
-		}
-		if t.MultiObservatory != nil || t.Observatory != nil {
+		groupSelectors := t.buildBalancersAndObservatory(serverData)
+		switch {
+		case t.Variant == where.XrayCore && t.Observatory != nil:
+			// Official xray exposes ObservatoryService under the xray-native gRPC name
+			// and returns the whole observation result in a single call.
+			t.ApiCloses = append(t.ApiCloses, XrayObservatoryProducer(port, groupSelectors))
+		case t.Variant == where.V2rayaCore && (t.MultiObservatory != nil || t.Observatory != nil):
 			// v2raya_core supports ObservatoryService via the v2ray-compat gRPC path.
-			if t.Variant == where.V2rayaCore {
-
-				var observatoryTags []string
-				for name, isGroup := range t.outNames() {
-					if isGroup {
-						observatoryTags = append(observatoryTags, name)
-					}
+			var observatoryTags []string
+			for name, isGroup := range t.outNames() {
+				if isGroup {
+					observatoryTags = append(observatoryTags, name)
 				}
-				t.ApiCloses = append(t.ApiCloses, ObservatoryProducer(port, observatoryTags))
 			}
+			t.ApiCloses = append(t.ApiCloses, ObservatoryProducer(port, observatoryTags))
 		}
 	}
 	t.API = &coreObj.APIObject{
